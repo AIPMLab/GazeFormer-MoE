@@ -1,7 +1,10 @@
 import random
 import os
 
-from moba_attn_zhao import moba_attn_varlen  
+try:
+    from moba_attn_zhao import moba_attn_varlen
+except ImportError:
+    moba_attn_varlen = None
 import torch
 from torch import Tensor
 import torch.nn as nn
@@ -387,7 +390,7 @@ class MoE(nn.Module):
         experts (nn.ModuleList): List of expert modules.
         shared_experts (nn.Module): Shared experts applied to all inputs.
     """
-    def __init__(self, embed_dim, n_routed_experts, n_activated_experts, n_shared_experts, moe_inter_dim):
+    def __init__(self, embed_dim, n_routed_experts, n_activated_experts, n_shared_experts, moe_inter_dim, expert_dropout=0.0):
         """
         Initializes the MoE module.
 
@@ -400,6 +403,7 @@ class MoE(nn.Module):
         self.n_routed_experts = n_routed_experts
         self.n_local_experts = n_routed_experts // world_size
         self.n_activated_experts = n_activated_experts
+        self.expert_dropout = expert_dropout
         self.experts_start_idx = rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.gate = Gate(embed_dim, n_routed_experts, n_activated_experts, n_expert_groups=1, n_limited_groups=1, score_func="softmax", route_scale=1.0)
@@ -420,6 +424,12 @@ class MoE(nn.Module):
         x_flat = x.view(-1, self.dim)  # [N, dim]
         weights, indices = self.gate(x_flat)  # weights, indices: [N, topk]
         N, topk = weights.shape
+
+        if self.training and self.expert_dropout > 0:
+            keep = torch.rand_like(weights) > self.expert_dropout
+            keep[:, 0] = True
+            weights = weights * keep
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
 
         y = torch.zeros_like(x_flat)
         for expert_idx in range(self.n_routed_experts):
@@ -586,11 +596,14 @@ class BlockMoba(nn.Module):
         self.moba_topk = moba_topk
 
         # 判断是否使用 FFN 或 MoE
-        self.n_dense_layers = 9  # 可按需调整
-        if layer_id is not None and layer_id < self.n_dense_layers:
-            self.moe = FeedForward(embed_dim, inter_dim)
-        else:
-            self.moe = MoE(embed_dim, n_routed_experts, n_activated_experts, n_shared_experts, moe_inter_dim)
+        self.moe = MoE(
+            embed_dim,
+            n_routed_experts,
+            n_activated_experts,
+            n_shared_experts,
+            moe_inter_dim,
+            expert_dropout=0.2,
+        )
 
         # 与原Block保持一致的归一化
         self.norm1 = RMSNorm(embed_dim, eps=1e-5)
@@ -1332,7 +1345,6 @@ class TransformerDeepSeek_gaze(nn.Module):
         self.proj_f2 = nn.Linear(512, d_model)
         self.proj_f3 = nn.Linear(2048, d_model)
         self.proj_patch = nn.Linear(d_model, d_model)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.layers = nn.ModuleList([
             BlockMoba(
                 d_model,
@@ -1359,13 +1371,10 @@ class TransformerDeepSeek_gaze(nn.Module):
             token_patch = self.dropout(self.proj_patch(raw_inputs["token_img_patch"]))
             token_list.append(token_patch)
         transformer_input = torch.cat(token_list, dim=1)
-        batch_size = transformer_input.size(0)
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        transformer_input = torch.cat([cls_tokens, transformer_input], dim=1)
         x = transformer_input
         for layer in self.layers:
             x = self.dropout(layer(x, cross_input=None, mask=mask))  # 在每层后加 Dropout
-        global_repr = x[:, 0, :]
+        global_repr = x.mean(dim=1)
         out = self.linear_head(global_repr)
         return out
     
