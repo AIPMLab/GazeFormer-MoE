@@ -4,13 +4,94 @@
 import clip
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import models
 import copy
 import timm
 from config import *
 from torchvision.models.feature_extraction import create_feature_extractor
 
-class GEWithCLIPModel(nn.Module):
+class SemanticPrototypeMixin:
+    def _init_semantic_prototypes(
+        self,
+        illum_tokens,
+        headpose_tokens,
+        bg_tokens,
+        desc_tokens,
+    ):
+        clip_model = copy.deepcopy(CLIP_MODEL)
+        clip_model.eval()
+        with torch.no_grad():
+            illum_feats = clip_model.encode_text(illum_tokens).float()
+            head_feats = clip_model.encode_text(headpose_tokens).float()
+            bg_feats = clip_model.encode_text(bg_tokens).float()
+            desc_feats = clip_model.encode_text(desc_tokens).float()
+        del clip_model
+        torch.cuda.empty_cache()
+
+        self.illum_feats = nn.Parameter(illum_feats)
+        self.head_feats = nn.Parameter(head_feats)
+        self.bg_feats = nn.Parameter(bg_feats)
+        self.desc_feats = nn.Parameter(desc_feats)
+        self.semantic_norm_f1 = nn.LayerNorm(illum_feats.shape[-1])
+        self.semantic_norm_f2 = nn.LayerNorm(illum_feats.shape[-1])
+
+    def semantic_parameters(self):
+        return [
+            self.illum_feats,
+            self.head_feats,
+            self.bg_feats,
+            self.desc_feats,
+            *self.semantic_norm_f1.parameters(),
+            *self.semantic_norm_f2.parameters(),
+        ]
+
+    def _select_prototype(self, img_norm, prototypes, scale):
+        prototypes = prototypes.float()
+        proto_norm = F.normalize(prototypes, dim=-1, eps=1e-6)
+        scores = scale * img_norm @ proto_norm.T
+        probs = F.softmax(scores, dim=-1)
+        hard_idx = probs.argmax(dim=-1)
+        hard = F.one_hot(hard_idx, num_classes=probs.size(-1)).type_as(probs)
+        weights = hard - probs.detach() + probs
+        selected = weights @ prototypes
+        return selected, scores
+
+    def compute_conditioned_features(self, img_feats):
+        img_feats = img_feats.float()
+        img_norm = F.normalize(img_feats, dim=-1, eps=1e-6)
+        scale = self.logit_scale.exp().clamp(max=50).float()
+
+        selected_illum, sim_illum = self._select_prototype(
+            img_norm, self.illum_feats, scale
+        )
+        selected_head, sim_head = self._select_prototype(
+            img_norm, self.head_feats, scale
+        )
+        selected_bg, sim_bg = self._select_prototype(img_norm, self.bg_feats, scale)
+        selected_desc, sim_desc = self._select_prototype(
+            img_norm, self.desc_feats, scale
+        )
+
+        feature_1 = self.semantic_norm_f1(img_feats + selected_illum + selected_bg)
+        feature_2 = self.semantic_norm_f2(img_feats + selected_desc + selected_head)
+        aux = {
+            "sim_illum": sim_illum,
+            "sim_head": sim_head,
+            "sim_bg": sim_bg,
+            "sim_label": sim_desc,
+            "img_norm": img_norm,
+        }
+        return feature_1, feature_2, aux
+
+    def _flatten_or_pool_cnn_features(self, other_face, batch_size):
+        feature_3 = self.main_model(other_face)
+        if isinstance(feature_3, dict):
+            feature_3 = feature_3["features"].mean(dim=(-2, -1))
+        return feature_3.reshape(batch_size, -1)
+
+
+class GEWithCLIPModel(SemanticPrototypeMixin, nn.Module):
     def __init__(
         self,
         irrelevant_feats_dim=512,
@@ -45,23 +126,9 @@ class GEWithCLIPModel(nn.Module):
         headpose_tokens = clip.tokenize(self.headpose_texts).to(DEVICE)
         bg_tokens = clip.tokenize(self.background_texts).to(DEVICE)
         self.label_tokens = clip.tokenize(self.label_texts).to(DEVICE)
-        clip_model_1 = copy.deepcopy(CLIP_MODEL)
-        clip_model_1.eval()
-        with torch.no_grad():
-            # encoder_t1
-            self.illum_feats = clip_model_1.encode_text(illum_tokens)
-            self.head_feats = clip_model_1.encode_text(headpose_tokens)
-            self.bg_feats = clip_model_1.encode_text(bg_tokens)
-
-            self.illum_norm = self.illum_feats / self.illum_feats.norm(
-                dim=-1, keepdim=True
-            )
-            self.head_norm = self.head_feats / self.head_feats.norm(
-                dim=-1, keepdim=True
-            )
-            self.bg_norm = self.bg_feats / self.bg_feats.norm(dim=-1, keepdim=True)
-        del clip_model_1
-        torch.cuda.empty_cache()
+        self._init_semantic_prototypes(
+            illum_tokens, headpose_tokens, bg_tokens, self.label_tokens
+        )
         self.model = CLIP_MODEL
         self.encoder_i = CLIP_MODEL.encode_image
         self.encoder_t2 = CLIP_MODEL.encode_text
@@ -95,42 +162,15 @@ class GEWithCLIPModel(nn.Module):
         other_face,
     ):
         img_feats = self.encoder_i(face)
-        label_feats = self.encoder_t2(self.label_tokens)
-
-        # 归一化后计算相似度，选出最高索引
-        img_norm = img_feats / img_feats.norm(dim=-1, keepdim=True)
-        label_norm = label_feats / label_feats.norm(dim=-1, keepdim=True)
-
-        sim_illum = self.logit_scale.exp() * img_norm @ self.illum_norm.T
-        sim_head = self.logit_scale.exp() * img_norm @ self.head_norm.T
-        sim_bg = self.logit_scale.exp() * img_norm @ self.bg_norm.T
-
-        scale = self.logit_scale.exp().clamp(max=10)
-        sim_label = scale * img_norm @ label_norm.T
-
-        idx_illum = sim_illum.argmax(dim=-1)
-        idx_head = sim_head.argmax(dim=-1)
-        idx_bg = sim_bg.argmax(dim=-1)
-        idx_label = sim_label.argmax(dim=-1)
-        selected_illum = self.illum_feats[idx_illum]
-        selected_head = self.head_feats[idx_head]
-        selected_bg = self.bg_feats[idx_bg]
-        selected_label = label_feats[idx_label]
-
-        feature_1 = img_feats + selected_illum + selected_head + selected_bg
-        feature_1 = feature_1 / feature_1.norm(dim=-1, keepdim=True)
-
-        feature_2 = img_feats + selected_label
-        feature_2 = feature_2 / feature_2.norm(dim=-1, keepdim=True)
-
-        # feature_3 = self.main_model(other_face).view(face.size(0), -1)
-        feature_3 = self.main_model(other_face).reshape(face.size(0), -1)
+        feature_1, feature_2, aux = self.compute_conditioned_features(img_feats)
+        sim_label = aux["sim_label"]
+        feature_3 = self._flatten_or_pool_cnn_features(other_face, face.size(0))
 
         fused = torch.cat([feature_1, feature_2, feature_3], dim=-1)
         gaze_pred = self.fuse_model(fused)
 
         return gaze_pred, sim_label, feature_1, feature_2
-class GEWithCLIPModel_zhao(nn.Module):
+class GEWithCLIPModel_zhao(SemanticPrototypeMixin, nn.Module):
     def __init__(
         self,
         irrelevant_feats_dim=512,
@@ -165,23 +205,9 @@ class GEWithCLIPModel_zhao(nn.Module):
         headpose_tokens = clip.tokenize(self.headpose_texts).to(DEVICE)
         bg_tokens = clip.tokenize(self.background_texts).to(DEVICE)
         self.label_tokens = clip.tokenize(self.label_texts).to(DEVICE)
-        clip_model_1 = copy.deepcopy(CLIP_MODEL)
-        clip_model_1.eval()
-        with torch.no_grad():
-            # encoder_t1
-            self.illum_feats = clip_model_1.encode_text(illum_tokens)
-            self.head_feats = clip_model_1.encode_text(headpose_tokens)
-            self.bg_feats = clip_model_1.encode_text(bg_tokens)
-
-            self.illum_norm = self.illum_feats / self.illum_feats.norm(
-                dim=-1, keepdim=True
-            )
-            self.head_norm = self.head_feats / self.head_feats.norm(
-                dim=-1, keepdim=True
-            )
-            self.bg_norm = self.bg_feats / self.bg_feats.norm(dim=-1, keepdim=True)
-        del clip_model_1
-        torch.cuda.empty_cache()
+        self._init_semantic_prototypes(
+            illum_tokens, headpose_tokens, bg_tokens, self.label_tokens
+        )
         self.model = CLIP_MODEL
         self.encoder_i = CLIP_MODEL.encode_image
         self.encoder_t2 = CLIP_MODEL.encode_text
@@ -218,36 +244,9 @@ class GEWithCLIPModel_zhao(nn.Module):
         other_face,
     ):
         img_feats = self.encoder_i(face)
-        label_feats = self.encoder_t2(self.label_tokens)
-
-        # 归一化后计算相似度，选出最高索引
-        img_norm = img_feats / img_feats.norm(dim=-1, keepdim=True)
-        label_norm = label_feats / label_feats.norm(dim=-1, keepdim=True)
-
-        sim_illum = self.logit_scale.exp() * img_norm @ self.illum_norm.T
-        sim_head = self.logit_scale.exp() * img_norm @ self.head_norm.T
-        sim_bg = self.logit_scale.exp() * img_norm @ self.bg_norm.T
-
-        scale = self.logit_scale.exp().clamp(max=10)
-        sim_label = scale * img_norm @ label_norm.T
-
-        idx_illum = sim_illum.argmax(dim=-1)
-        idx_head = sim_head.argmax(dim=-1)
-        idx_bg = sim_bg.argmax(dim=-1)
-        idx_label = sim_label.argmax(dim=-1)
-        selected_illum = self.illum_feats[idx_illum]
-        selected_head = self.head_feats[idx_head]
-        selected_bg = self.bg_feats[idx_bg]
-        selected_label = label_feats[idx_label]
-
-        feature_1 = img_feats + selected_illum + selected_head + selected_bg
-        feature_1 = feature_1 / feature_1.norm(dim=-1, keepdim=True)
-
-        feature_2 = img_feats + selected_label
-        feature_2 = feature_2 / feature_2.norm(dim=-1, keepdim=True)
-
-        # feature_3 = self.main_model(other_face).view(face.size(0), -1)
-        feature_3 = self.main_model(other_face).reshape(face.size(0), -1)
+        feature_1, feature_2, aux = self.compute_conditioned_features(img_feats)
+        sim_label = aux["sim_label"]
+        feature_3 = self._flatten_or_pool_cnn_features(other_face, face.size(0))
 
         fused = torch.cat([feature_1, feature_2, feature_3], dim=-1)
         gaze_pred = self.fuse_model(fused)
