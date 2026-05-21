@@ -98,29 +98,7 @@ def process_batch(batch, model):
         token_img_patch = None
         print("Hook did not capture full tokens.")
 
-    # 以下计算全局特征，主要基于 img_feats 及选取的其它信息
-    label_feats = model.encoder_t2(model.label_tokens)
-    img_norm = img_feats / (img_feats.norm(dim=-1, keepdim=True) + 1e-2)
-    label_norm = label_feats / (label_feats.norm(dim=-1, keepdim=True) + 1e-2)
-    sim_illum = model.logit_scale.exp() * img_norm @ model.illum_norm.T
-    sim_head = model.logit_scale.exp() * img_norm @ model.head_norm.T
-    sim_bg = model.logit_scale.exp() * img_norm @ model.bg_norm.T
-    sim_label = model.logit_scale.exp() * img_norm @ label_norm.T
-
-    idx_illum = sim_illum.argmax(dim=-1)
-    idx_head = sim_head.argmax(dim=-1)
-    idx_bg = sim_bg.argmax(dim=-1)
-    idx_label = sim_label.argmax(dim=-1)
-
-    selected_illum = model.illum_feats[idx_illum]
-    selected_head = model.head_feats[idx_head]
-    selected_bg = model.bg_feats[idx_bg]
-    selected_label = label_feats[idx_label]
-
-    feature_1 = img_feats + selected_illum + selected_head + selected_bg
-    feature_1 = feature_1 / (feature_1.norm(dim=-1, keepdim=True) + 1e-3)
-    feature_2 = img_feats + selected_label
-    feature_2 = feature_2 / (feature_2.norm(dim=-1, keepdim=True) + 1e-3)
+    feature_1, feature_2, aux = model.compute_conditioned_features(img_feats)
 
     # 获取 CNN 特征图并生成局部 token
     feature_map = model.main_model(_input.other_face)["features"]  # shape: [B, C, H, W]
@@ -154,20 +132,21 @@ def process_batch(batch, model):
             features["token_img_patch"] = torch.zeros_like(token_img_patch)
         else:
             features["token_img_patch"] = None
+    features["sim_label"] = aux["sim_label"]
     return features
 
 def feature_separation_loss(f1, f2, epsilon=1e-6):
+    f1_n = f1.float() / (f1.float().norm(dim=-1, keepdim=True) + epsilon)
+    f2_n = f2.float() / (f2.float().norm(dim=-1, keepdim=True) + epsilon)
+    return (f1_n * f2_n).sum(dim=-1).abs().mean()
 
-    return ((f1 * f2).sum(dim=-1) / ((f1.norm(dim=-1) * f2.norm(dim=-1)).clamp(min=epsilon).pow(2))).mean()
 def angular_loss(pred, target):
-    # 归一化
+    pred = pred.float()
+    target = target.float()
     pred_n = pred / (pred.norm(dim=-1, keepdim=True) + 1e-6)
     target_n = target / (target.norm(dim=-1, keepdim=True) + 1e-6)
-    # 计算余弦相似度
     cos_sim = (pred_n * target_n).sum(dim=-1).clamp(-1.0, 1.0)
-    # 计算角度（弧度），再取均值
-    loss = torch.acos(cos_sim).mean()
-    return loss
+    return (1.0 - cos_sim).mean()
 
 
 if __name__ == "__main__":
@@ -243,9 +222,7 @@ if __name__ == "__main__":
 
     # 加载主模型（例如 CLIP 模型）到 GPU
     model = GEWithCLIPModel().to(DEVICE)
-    for param in model.model.visual.parameters():
-        param.requires_grad = False
-    for param in model.model.transformer.parameters():
+    for param in model.model.parameters():
         param.requires_grad = False
     # model.main_model = model.main_model.half()  # 如果 main_model 是 CNN
 
@@ -264,10 +241,9 @@ if __name__ == "__main__":
         out_dim=3  # gaze 输出维度为 3
     ).to(DEVICE)
 
-    criterion = torch.nn.HuberLoss()
-
     optimizer = torch.optim.AdamW(
     list(transformer_model.parameters()) +
+    list(model.semantic_parameters()) +
     list(model.fuse_model.parameters()) +
     list(model.main_model.parameters()),
   # 加上这行
@@ -307,9 +283,8 @@ if __name__ == "__main__":
                 loss_gaze = angular_loss(output_safe, label_safe)
                 # 新增特征分离损失
                 loss_sep = feature_separation_loss(raw_inputs["feature_1"], raw_inputs["feature_2"])
-                # 总损失
-                lambda_sep = 1.0  # 可调节权重
-                loss = loss_gaze + lambda_sep * loss_sep
+                # Within-domain training follows the paper objective: angular loss only.
+                loss = loss_gaze
                 pred_n = output_safe / (output_safe.norm(dim=-1, keepdim=True) + 1e-6)
                 gt_n = label_safe / (label_safe.norm(dim=-1, keepdim=True) + 1e-6)
                 cos_sim = (pred_n * gt_n).sum(dim=-1).clamp(-1.0, 1.0)
@@ -364,7 +339,7 @@ if __name__ == "__main__":
             print(f"Best model saved to {best_model_path}")
         transformer_model.train()
         model.train()
-    scheduler.step()
+        scheduler.step()
     # 每轮训练后在训练集上推理并输出2D预测与GT
     if TRAIN_DATASET_NAME == "ETH-XGaze":
         transformer_model.eval()
