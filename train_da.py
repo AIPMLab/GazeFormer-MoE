@@ -125,34 +125,7 @@ def process_batch(batch, model):
     else:
         token_img_patch = None
 
-    # 以下计算全局特征，主要基于 img_feats 及选取的其它信息
-    # 使用预计算的 label feats，避免每步调用 encode_text 造成 dtype 不一致
-    # 为了稳定的相似度计算，临时在 float32 中进行，再回到原始精度
-    label_feats = model.precomputed_label_feats.float()  # [8,512]
-    label_norm = model.precomputed_label_norm.float()
-    img_feats_f = img_feats.float()
-    img_norm_f = img_feats_f / (img_feats_f.norm(dim=-1, keepdim=True) + 1e-6)
-    scale = model.logit_scale.exp().clamp(max=50).float()  # 防止过大导致 Inf
-    sim_illum = scale * img_norm_f @ model.illum_norm.float().T
-    sim_head  = scale * img_norm_f @ model.head_norm.float().T
-    sim_bg    = scale * img_norm_f @ model.bg_norm.float().T
-    sim_label = scale * img_norm_f @ label_norm.T
-
-    idx_illum = sim_illum.argmax(dim=-1)
-    idx_head = sim_head.argmax(dim=-1)
-    idx_bg = sim_bg.argmax(dim=-1)
-    idx_label = sim_label.argmax(dim=-1)
-
-    selected_illum = model.illum_feats[idx_illum].float()
-    selected_head  = model.head_feats[idx_head].float()
-    selected_bg    = model.bg_feats[idx_bg].float()
-    selected_label = label_feats[idx_label].float()
-
-    feature_1 = (img_feats_f + selected_illum + selected_head + selected_bg)
-    feature_1 = feature_1 / (feature_1.norm(dim=-1, keepdim=True) + 1e-3)
-    feature_2 = (img_feats_f + selected_label)
-    feature_2 = feature_2 / (feature_2.norm(dim=-1, keepdim=True) + 1e-3)
-    # 转回原始精度 (通常为半精度) 供后续 Transformer 使用，减少显存
+    feature_1, feature_2, aux = model.compute_conditioned_features(img_feats)
     feature_1 = feature_1.to(orig_dtype)
     feature_2 = feature_2.to(orig_dtype)
 
@@ -190,9 +163,9 @@ def process_batch(batch, model):
             features["token_img_patch"] = None
     # expose img_norm and sim_label for downstream pseudo-label generation
     # img_norm: [B, dim], sim_label: [B, n_labels]
-    features["img_norm"] = img_norm_f.to(orig_dtype)
+    features["img_norm"] = aux["img_norm"].to(orig_dtype)
     # 相似度保留 float32 以便后续阈值判断（若使用伪标签）
-    features["sim_label"] = sim_label  # float32
+    features["sim_label"] = aux["sim_label"]  # float32
     return features
 
 def debug_check_tensor(name, t):
@@ -264,13 +237,12 @@ def feature_separation_loss(f1, f2, epsilon=1e-6):
     cos = (f1_n * f2_n).sum(dim=-1).clamp(-1.0, 1.0)
     return cos.abs().mean()
 def angular_loss(pred, target):
-    # 在 float32 中计算角度，提升数值精度
     pf = pred.float()
     tf = target.float()
     pred_n = pf / (pf.norm(dim=-1, keepdim=True) + 1e-6)
     target_n = tf / (tf.norm(dim=-1, keepdim=True) + 1e-6)
     cos_sim = (pred_n * target_n).sum(dim=-1).clamp(-1.0, 1.0)
-    return torch.acos(cos_sim).mean()
+    return (1.0 - cos_sim).mean()
 
 if __name__ == "__main__":
     # torch.autograd.set_detect_anomaly(True)
@@ -426,28 +398,9 @@ if __name__ == "__main__":
 
     # 加载主模型（例如 CLIP 模型）到 GPU
     model = GEWithCLIPModel().to(DEVICE)
-    # 对抗域适应场景下希望优化 ViT 与 CNN 特征，故不冻结视觉编码器
-    if not DOMAIN_ADAPTATION:
-        for param in model.model.visual.parameters():
-            param.requires_grad = False
-        for param in model.model.transformer.parameters():
-            param.requires_grad = False
-    else:
-        # 使用域适应时：若启用 AMP，我们仍将可训练参数保持 float32（CLIP 预训练可能是 fp16），以配合 GradScaler；
-        # 仅在无 GPU 时再强制 float()（容错）
-        model.model.float()
-        model.illum_feats = model.illum_feats.float()
-        model.head_feats = model.head_feats.float()
-        model.bg_feats = model.bg_feats.float()
-        model.illum_norm = model.illum_norm.float()
-        model.head_norm = model.head_norm.float()
-        model.bg_norm = model.bg_norm.float()
-    # 预计算 label feats（在当前 dtype 下）
-    with torch.no_grad():
-        lf = model.encoder_t2(model.label_tokens)
-        model.precomputed_label_feats = lf.float()
-        model.precomputed_label_norm = model.precomputed_label_feats / (model.precomputed_label_feats.norm(dim=-1, keepdim=True) + 1e-6)
-    print(f"[INFO] Precomputed label feats dtype={model.precomputed_label_feats.dtype}, shape={model.precomputed_label_feats.shape}")
+    for param in model.model.parameters():
+        param.requires_grad = False
+    model.model.float()
     # model.main_model = model.main_model.half()  # 如果 main_model 是 CNN
 
     # 实例化 TransformerDeepSeek_gaze 模型，注意内部投影层参数维度需跟数据一致：
@@ -464,8 +417,6 @@ if __name__ == "__main__":
         d_model=768,  # 统一投影到 768 维
         out_dim=3  # gaze 输出维度为 3
     ).to(DEVICE)
-
-    criterion = torch.nn.HuberLoss()
 
     # -----------------------------
     # 域适应: 定义梯度反转层 & 域判别器
@@ -498,10 +449,12 @@ if __name__ == "__main__":
     USE_ENTROPY_CONFUSION = False # 不再使用熵混淆
     # Prototype alignment removed in adversarial-only pruning
     
-    trainable_params = list(transformer_model.parameters()) + list(model.fuse_model.parameters()) + list(model.main_model.parameters())
-    if DOMAIN_ADAPTATION:
-        # 同时微调 CLIP（包含 visual 与 transformer）与 CNN，按你的需求一起优化
-        trainable_params += list(model.model.parameters())
+    trainable_params = (
+        list(transformer_model.parameters())
+        + list(model.semantic_parameters())
+        + list(model.fuse_model.parameters())
+        + list(model.main_model.parameters())
+    )
 
     # 主优化器不包含判别器的参数；判别器单独优化以稳定对抗训练
     optimizer = torch.optim.AdamW(
@@ -649,7 +602,7 @@ if __name__ == "__main__":
     except Exception:
         pass
     try:
-        print('[DTypeCheck] precomputed_label_feats dtype:', model.precomputed_label_feats.dtype)
+        print('[DTypeCheck] desc prototype dtype:', model.desc_feats.dtype)
     except Exception:
         pass
     global_step = 0
@@ -787,7 +740,7 @@ if __name__ == "__main__":
                 label_safe = torch.nan_to_num(raw_inputs["label"], nan=0.0, posinf=1e6, neginf=-1e6)
                 loss_gaze = angular_loss(output_safe, label_safe)
                 loss_sep = feature_separation_loss(raw_inputs["feature_1"], raw_inputs["feature_2"])
-                lambda_sep = 0.0
+                lambda_sep = 1.0 if DOMAIN_ADAPTATION else 0.0
                 total_loss = loss_gaze + lambda_sep * loss_sep
 
                 # 若启用，计算目标子集的监督损失并加入总损失（有标签的目标域样本用于有监督适配）
