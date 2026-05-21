@@ -215,14 +215,32 @@ def main(
     # )
     epsilon = 1e-6
     features_loss = (
-        lambda f1, f2: ((f1 * f2).sum(dim=-1)
-                        / ((f1.norm(dim=-1) * f2.norm(dim=-1)).clamp(min=epsilon).pow(2))).mean()
+        lambda f1, f2: (
+            (
+                f1.float() / (f1.float().norm(dim=-1, keepdim=True) + epsilon)
+            )
+            * (
+                f2.float() / (f2.float().norm(dim=-1, keepdim=True) + epsilon)
+            )
+        ).sum(dim=-1).abs().mean()
     )
     ce_loss = nn.CrossEntropyLoss()
-    gaze_loss = nn.L1Loss()
+    def gaze_loss(pred, target):
+        pred_n = pred.float() / (pred.float().norm(dim=-1, keepdim=True) + epsilon)
+        target_n = target.float() / (target.float().norm(dim=-1, keepdim=True) + epsilon)
+        return (1.0 - (pred_n * target_n).sum(dim=-1).clamp(-1.0, 1.0)).mean()
     # torch.autograd.set_detect_anomaly(True)
     # optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    optimizer = optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=0.9, weight_decay=1e-4)
+    for param in model.model.parameters():
+        param.requires_grad = False
+    optimizer = optim.SGD(
+        list(model.semantic_parameters()) +
+        list(model.fuse_model.parameters()) +
+        list(model.main_model.parameters()),
+        lr=LEARNING_RATE,
+        momentum=0.9,
+        weight_decay=1e-4,
+    )
     if IS_TRAIN:
         model.train()
         best_val_sum_loss = float("inf")
